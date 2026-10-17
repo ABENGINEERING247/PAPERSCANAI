@@ -1,8 +1,7 @@
-streamlit>=1.40.0
-openai>=1.50.0
-Pillow>=10.0.0
-pypdf>=5.0.0
-python-docx>=1.1.2
-reportlab>=4.2.0
-pymupdf>=1.24.0
-pytesseract>=0.3.13
+streamlit
+openai
+Pillow
+pymupdf
+python-docx
+reportlab
+pytesseract
