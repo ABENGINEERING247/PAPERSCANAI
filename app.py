@@ -84,8 +84,11 @@ def ocr_with_openai(image: Image.Image, instructions: str) -> str:
     if client is None:
         raise RuntimeError("OpenAI API key/client is not configured.")
     model = st.session_state.get("vision_model", "gpt-4o-mini")
+    temperature = st.session_state.get("ai_temperature", 0.1)
+    
     response = client.responses.create(
         model=model,
+        temperature=temperature,
         instructions=(
             "You are a careful OCR engine. Transcribe all visible text faithfully. "
             "Preserve paragraph breaks, headings, lists, tables where practical, and punctuation. "
@@ -138,12 +141,16 @@ def make_pdf(text, title="PaperScan AI document"):
     buf.seek(0)
     return buf.getvalue()
 
-def ask_ai(prompt, text, model="gpt-4o-mini"):
+def ask_ai(prompt, text):
     client = get_client()
     if client is None:
         raise RuntimeError("Add OPENAI_API_KEY to Streamlit Secrets or environment variables to use AI tools.")
+    model = st.session_state.get("vision_model", "gpt-4o-mini")
+    temperature = st.session_state.get("ai_temperature", 0.1)
+    
     response = client.responses.create(
         model=model,
+        temperature=temperature,
         instructions="You are PaperScan AI, a precise document editor and writing assistant. Follow the user's requested output format. Never invent facts or silently change names, dates, amounts, or technical details.",
         input=f"{prompt}\n\nDOCUMENT / CONTEXT:\n{text}",
     )
@@ -152,18 +159,37 @@ def ask_ai(prompt, text, model="gpt-4o-mini"):
 st.markdown("""
 <div class="hero">
   <h1>📜 PaperScan AI</h1>
-  <p>Turn handwritten notes, printed pages, and scanned documents into editable text and polished documents.</p>
+  <p>Turn handwritten notes, printed pages, webcam photos, and scanned documents into editable text and polished documents.</p>
 </div>
 """, unsafe_allow_html=True)
 st.write("")
 col1, col2, col3 = st.columns(3)
-col1.metric("OCR workspace", "Image + PDF")
+col1.metric("OCR workspace", "Image + PDF + Camera")
 col2.metric("Export formats", "TXT · PDF · DOCX")
 col3.metric("Writing tools", "Polish · Email · Chat")
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    st.session_state.vision_model = st.selectbox("Vision/OCR model", ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"], index=0)
+    
+    # Model configuration including custom names like gpt-6-luna
+    default_models = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o", "gpt-6-luna"]
+    selected_model_option = st.selectbox("Vision/OCR model", default_models + ["Custom model..."], index=0)
+    
+    if selected_model_option == "Custom model...":
+        st.session_state.vision_model = st.text_input("Enter custom model name", value="gpt-6-luna")
+    else:
+        st.session_state.vision_model = selected_model_option
+
+    # Temperature control slider
+    st.session_state.ai_temperature = st.slider(
+        "AI Temperature", 
+        min_value=0.0, 
+        max_value=1.0, 
+        value=0.1, 
+        step=0.05,
+        help="Lower values (e.g. 0.1) make OCR & extraction more deterministic and factual. Higher values increase creative variability."
+    )
+
     st.caption("AI OCR and writing tools require an OpenAI API key.")
     if get_api_key():
         st.success("OpenAI API key detected")
@@ -175,73 +201,90 @@ with st.sidebar:
 tabs = st.tabs(["🔎 Scan & OCR", "✨ Polish with AI", "✉️ Email Formatter", "🔄 File Converter", "💬 Assistant"])
 
 with tabs[0]:
-    st.subheader("Scan handwritten or printed pages")
-    uploaded = st.file_uploader("Upload an image or PDF", type=["png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "pdf"], key="scan_upload")
+    st.subheader("Scan handwritten or printed pages (Upload or Camera)")
+    
+    input_source = st.radio("Choose input source", ["Upload File (Image/PDF)", "Live Camera / Mobile Capture"], horizontal=True)
+    
+    uploaded = None
+    imgs = []
+    is_pdf = False
+
+    if input_source == "Upload File (Image/PDF)":
+        uploaded = st.file_uploader("Upload an image or PDF", type=["png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "pdf"], key="scan_upload")
+        if uploaded:
+            file_bytes = uploaded.getvalue()
+            is_pdf = uploaded.name.lower().endswith(".pdf")
+            if is_pdf:
+                st.info(f"PDF selected: {uploaded.name}")
+                if fitz is not None:
+                    try:
+                        imgs, total_pages = pdf_pages_to_images(file_bytes)
+                        st.caption(f"{total_pages} page(s) found. OCR processes up to 15 pages per run.")
+                        if imgs:
+                            st.image(imgs[0], caption="Preview — first page", use_container_width=True)
+                    except Exception as e:
+                        imgs = []
+                        st.warning(f"Could not render PDF preview: {e}")
+                else:
+                    imgs = []
+            else:
+                try:
+                    image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+                    st.image(image, caption=uploaded.name, use_container_width=True)
+                    imgs = [image]
+                except Exception as e:
+                    imgs = []
+                    st.error(f"Could not open image: {e}")
+    else:
+        st.info("💡 Use your device's webcam or mobile camera to snap front/back pages, notes, or documents.")
+        camera_image = st.camera_input("Take a photo of the document / page")
+        if camera_image:
+            try:
+                cam_img = Image.open(io.BytesIO(camera_image.getvalue())).convert("RGB")
+                imgs = [cam_img]
+                st.success("Capture successful!")
+            except Exception as e:
+                st.error(f"Could not load camera capture: {e}")
+
     col_a, col_b = st.columns([1, 1])
     with col_a:
         method = st.radio("OCR method", ["AI OCR (best for handwriting)", "Local Tesseract OCR", "Extract embedded PDF text"], index=0)
     with col_b:
-        extra = st.text_input("Optional context (e.g., English, Urdu, engineering notes)", "")
-    if uploaded:
-        file_bytes = uploaded.getvalue()
-        is_pdf = uploaded.name.lower().endswith(".pdf")
-        if is_pdf:
-            st.info(f"PDF selected: {uploaded.name}")
-            if fitz is not None:
-                try:
-                    imgs, total_pages = pdf_pages_to_images(file_bytes)
-                    st.caption(f"{total_pages} page(s) found. OCR processes up to 15 pages per run.")
-                    if imgs:
-                        st.image(imgs[0], caption="Preview — first page", use_container_width=True)
-                except Exception as e:
-                    imgs = []
-                    st.warning(f"Could not render PDF preview: {e}")
-            else:
-                imgs = []
-        else:
-            try:
-                image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-                st.image(image, caption=uploaded.name, use_container_width=True)
-                imgs = [image]
-            except Exception as e:
-                imgs = []
-                st.error(f"Could not open image: {e}")
-        if st.button("🚀 Extract text", type="primary", use_container_width=True):
-            try:
-                if method == "Extract embedded PDF text":
-                    if not is_pdf:
-                        st.warning("Choose a PDF to extract embedded text.")
-                    else:
-                        result = extract_pdf_text(file_bytes)
-                        if not result:
-                            st.warning("No embedded text found. This may be a scanned PDF; select AI OCR or Tesseract instead.")
-                        else:
-                            st.session_state.ocr_text = result
-                elif method == "AI OCR (best for handwriting)":
-                    if get_client() is None:
-                        st.error("AI OCR requires OPENAI_API_KEY. Add it in Streamlit Secrets, or use local Tesseract.")
-                    else:
-                        if is_pdf and not imgs:
-                            imgs, _ = pdf_pages_to_images(file_bytes)
-                        if not imgs:
-                            st.error("No pages available to process.")
-                        else:
-                            output = []
-                            progress = st.progress(0)
-                            for idx, img in enumerate(imgs):
-                                output.append(f"--- Page {idx + 1} ---\n" + ocr_with_openai(img, extra))
-                                progress.progress((idx + 1) / len(imgs))
-                            st.session_state.ocr_text = "\n\n".join(output).strip()
+        extra = st.text_input("Optional context (e.g., English, Urdu, front/back page notes)", "")
+
+    if st.button("🚀 Extract text", type="primary", use_container_width=True):
+        try:
+            if method == "Extract embedded PDF text":
+                if not uploaded or not is_pdf:
+                    st.warning("Choose a PDF file upload to extract embedded text.")
                 else:
-                    if is_pdf and not imgs:
-                        imgs, _ = pdf_pages_to_images(file_bytes)
-                    if not imgs:
-                        st.error("No image pages available for local OCR.")
+                    result = extract_pdf_text(uploaded.getvalue())
+                    if not result:
+                        st.warning("No embedded text found. This may be a scanned PDF; select AI OCR or Tesseract instead.")
                     else:
-                        output = [f"--- Page {idx + 1} ---\n{ocr_with_tesseract(img)}" for idx, img in enumerate(imgs)]
+                        st.session_state.ocr_text = result
+            elif method == "AI OCR (best for handwriting)":
+                if get_client() is None:
+                    st.error("AI OCR requires OPENAI_API_KEY. Add it in Streamlit Secrets, or use local Tesseract.")
+                else:
+                    if not imgs:
+                        st.error("No pages or camera captures available to process.")
+                    else:
+                        output = []
+                        progress = st.progress(0)
+                        for idx, img in enumerate(imgs):
+                            output.append(f"--- Page/Capture {idx + 1} ---\n" + ocr_with_openai(img, extra))
+                            progress.progress((idx + 1) / len(imgs))
                         st.session_state.ocr_text = "\n\n".join(output).strip()
-            except Exception as e:
-                st.error(f"OCR failed: {e}")
+            else:
+                if not imgs:
+                    st.error("No image pages available for local OCR.")
+                else:
+                    output = [f"--- Page/Capture {idx + 1} ---\n{ocr_with_tesseract(img)}" for idx, img in enumerate(imgs)]
+                    st.session_state.ocr_text = "\n\n".join(output).strip()
+        except Exception as e:
+            st.error(f"OCR failed: {e}")
+
     st.markdown("#### Extracted text")
     st.session_state.ocr_text = st.text_area("Review and edit OCR output before exporting", value=st.session_state.ocr_text, height=280, key="ocr_editor")
     text_out = st.session_state.ocr_text
@@ -265,7 +308,7 @@ with tabs[1]:
     ])
     if st.button("✨ Improve content", type="primary"):
         try:
-            result = ask_ai(f"Task: {goal}. Preserve all factual details, names, dates, numbers, and technical meaning. If uncertain, flag it rather than guessing.", polish_source, st.session_state.vision_model)
+            result = ask_ai(f"Task: {goal}. Preserve all factual details, names, dates, numbers, and technical meaning. If uncertain, flag it rather than guessing.", polish_source)
             st.session_state.polished = result
         except Exception as e:
             st.error(str(e))
@@ -286,7 +329,7 @@ with tabs[2]:
     if st.button("✉️ Format email", type="primary"):
         try:
             prompt = f"Create a ready-to-send email. Purpose: {email_goal}. Recipient: {recipient or 'not specified'}. Topic: {subject or 'derive a concise subject'}. Tone: {tone}. Include a subject line and email body. Do not invent commitments or details."
-            st.session_state.formatted_email = ask_ai(prompt, email_notes, st.session_state.vision_model)
+            st.session_state.formatted_email = ask_ai(prompt, email_notes)
         except Exception as e:
             st.error(str(e))
     formatted_email = st.text_area("Formatted email", value=st.session_state.get("formatted_email", ""), height=260, key="email_result")
@@ -335,7 +378,7 @@ with tabs[4]:
             st.markdown(user_msg)
         context = st.session_state.ocr_text or "(No scanned text in workspace yet.)"
         try:
-            answer = ask_ai("Answer the user's question about the document or writing task. If context is insufficient, say what is missing. Be accurate and helpful.\nUSER QUESTION: " + user_msg, context, st.session_state.vision_model)
+            answer = ask_ai("Answer the user's question about the document or writing task. If context is insufficient, say what is missing. Be accurate and helpful.\nUSER QUESTION: " + user_msg, context)
         except Exception as e:
             answer = f"AI assistant is unavailable: {e}"
         st.session_state.chat.append({"role": "assistant", "content": answer})
